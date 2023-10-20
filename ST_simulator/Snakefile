@@ -1,0 +1,357 @@
+import os
+
+SAMPLE_LI = ["Eye"]
+REP_LI = ["rep0"]
+
+embedding_dict = {
+    "tSNE": {"embedding": "tSNE", "embedding_dim": 2},
+    "UMAP2": {"embedding": "UMAP", "embedding_dim": 2},
+    "UMAP3": {"embedding": "UMAP", "embedding_dim": 3}
+    }
+
+domain_params = {
+    "small": {"smooth_radius": 1, "receptive_radius": 24, "emb_radius": 5, "merge_emb_dist": 5, "min_spot_num": 300},
+    "large": {"smooth_radius": 60, "receptive_radius": 200, "emb_radius": 20, "merge_emb_dist": 15, "min_spot_num": 4000}
+}
+
+rule RedeViz_pretreat:
+    input:
+        h5ad = os.path.join("data", "{sample}_simple.h5ad"),
+    output:
+        index = os.path.join("analysis", "RedeViz_embedding_info", "{embedding}", "{sample}", "pretreat.pkl"),
+        emb_info = os.path.join("analysis", "RedeViz_embedding_info", "{embedding}", "{sample}", "Embedding.bin.info.tsv"),
+    params:
+        min_cell_num = 2,
+        cell_type_label = "cell_ontology_class",
+        gene_id_label = "gene_symbol",
+        out_dir = os.path.join("analysis", "RedeViz_embedding_info", "{embedding}", "{sample}"),
+        embedding = lambda wildcards: embedding_dict[wildcards.embedding]["embedding"],
+        embedding_dim = lambda wildcards: embedding_dict[wildcards.embedding]["embedding_dim"],
+    threads: 28
+    shell:
+        """
+RedeViz enhance pretreat \
+    -i {input.h5ad} \
+    --cell-type-label {params.cell_type_label} \
+    --gene-id-label {params.gene_id_label} \
+    --embedding {params.embedding} \
+    --embedding-dim {params.embedding_dim} \
+    --min-cell-num {params.min_cell_num} \
+    -o {params.out_dir}
+        """
+
+rule cell_type2color:
+    input:
+        emb_info = os.path.join("analysis", "RedeViz_embedding_info", "tSNE", "{sample}", "Embedding.bin.info.tsv"),
+    output:
+        color = os.path.join("analysis", "cell_type_color", "{sample}.color.tsv"),
+    params:
+        cell_type2color = "python scripts/cell_type2color.py",
+    shell:
+        """
+{params.cell_type2color} \
+    --emb-info {input.emb_info} \
+    --output {output.color}
+        """
+
+rule ST_simulator:
+    input:
+        index = os.path.join("analysis", "RedeViz_embedding_info", "tSNE", "{sample}", "pretreat.pkl"),
+    output:
+        RNA_points = os.path.join("analysis", "simulated_ST_data", "{sample}", "{rep}", "RNA_points.tsv"),
+        cell_shape = os.path.join("analysis", "simulated_ST_data", "{sample}", "{rep}", "CellShapeInfo.tsv"),
+        div_shape = os.path.join("analysis", "simulated_ST_data", "{sample}", "{rep}", "DivShape.tsv"),
+    params:
+        out_dir = os.path.join("analysis", "simulated_ST_data", "{sample}", "{rep}"),
+        x_range = 1000000,
+        y_range = 1000000,
+    shell:
+        """
+RedeViz simulator simulate_by_emb \
+    -i {input.index} \
+    --x-range {params.x_range} \
+    --y-range {params.y_range} \
+    -o {params.out_dir}
+        """
+
+rule point2spot:
+    input:
+        RNA_points = rules.ST_simulator.output.RNA_points,
+        cell_shape = rules.ST_simulator.output.cell_shape,
+    output:
+        spot = os.path.join("analysis", "simulated_ST_data", "{sample}", "{rep}", "spot.tsv"),
+        spot_info = os.path.join("analysis", "simulated_ST_data", "{sample}", "{rep}", "Spot.CellType.tsv"),
+    params:
+        out_dir = rules.ST_simulator.params.out_dir,
+        x_range = rules.ST_simulator.params.x_range,
+        y_range = rules.ST_simulator.params.y_range,
+        gap_size = 500,
+        spot_size = 220,
+        UMI_per_spot = 1.5,
+    shell:
+        """
+RedeViz simulator point2spot \
+    -i {input.RNA_points} \
+    -o {params.out_dir} \
+    --cell-shape-info {input.cell_shape} \
+    --x-range {params.x_range} \
+    --y-range {params.y_range} \
+    --gap-size {params.gap_size} \
+    --spot-size {params.spot_size} \
+    --UMI-per-spot {params.UMI_per_spot}
+        """
+
+rule extract_simulated_expr:
+    input:
+        index = rules.ST_simulator.input.index,
+        gene_li = os.path.join("data", "{sample}.gene_li.txt"),
+        spot_info = rules.point2spot.output.spot_info,
+        cell_shape = rules.ST_simulator.output.cell_shape,
+    output:
+        flag = touch(os.path.join("analysis", "simulated_expr", "{sample}", "{rep}", "done.flag"))
+    params:
+        out_dir = os.path.join("analysis", "simulated_expr", "{sample}", "{rep}"),
+    shell:
+        """
+RedeViz simulator extract_simulated_expr \
+    --emb-info {input.index} \
+    --gene-list {input.gene_li} \
+    --spot-info {input.spot_info} \
+    --cell-shape {input.cell_shape} \
+    -o {params.out_dir}
+        """
+
+rule extract_all_simulated_expr:
+    input:
+        index = rules.ST_simulator.input.index,
+        spot_info = rules.point2spot.output.spot_info,
+        cell_shape = rules.ST_simulator.output.cell_shape,
+    output:
+        flag = touch(os.path.join("analysis", "simulated_expr", "{sample}", "{rep}", "done.all.flag"))
+    params:
+        out_dir = os.path.join("analysis", "simulated_expr", "{sample}", "{rep}"),
+    shell:
+        """
+RedeViz simulator extract_simulated_expr \
+    --emb-info {input.index} \
+    --spot-info {input.spot_info} \
+    --cell-shape {input.cell_shape} \
+    -o {params.out_dir}
+        """
+
+rule plot_simulated_gene_expr:
+    input:
+        flag = rules.extract_simulated_expr.output,
+    output:
+        img = os.path.join("analysis", "simulated_expr", "{sample}", "{rep}", "KRT12_KRT19_CD74.png")
+    params:
+        data_dir = rules.extract_simulated_expr.params.out_dir,
+    shell:
+        """
+RedeViz posttreatment plot_gene_expr \
+    -R {params.data_dir}/KRT12.simulated.npz \
+    -G {params.data_dir}/KRT19.simulated.npz \
+    -B {params.data_dir}/CD74.simulated.npz \
+    -o {output.img}
+        """
+
+rule spot2bin:
+    input:
+        spot = rules.point2spot.output.spot,
+    output:
+        res = os.path.join("analysis", "simulated_ST_data", "{sample}", "{rep}", "bin{bin_size}.tsv"),
+    params:
+        x_index_label = "spot_x_index",
+        y_index_label = "spot_y_index",
+        gene_name_label = "Gid",
+        UMI_label = "UMI",
+    shell:
+        """
+RedeViz pretreatment spot2bin \
+    --spot {input.spot} \
+    --bin-size {wildcards.bin_size} \
+    --x-index-label {params.x_index_label} \
+    --y-index-label {params.y_index_label} \
+    --gene-name-label {params.gene_name_label} \
+    --UMI-label {params.UMI_label} \
+    --output {output.res}
+        """
+
+rule plot_bin_expr:
+    input:
+        signal = rules.spot2bin.output.res,
+    output:
+        img = os.path.join("analysis", "bin_expr", "{sample}", "{rep}.bin{bin_size}", "KRT12_KRT19_CD74.png"),
+    params:
+        plot_multi_gene_expr = "python scripts/plot_multi_gene_expr.py",
+        out_dir = os.path.join("analysis", "bin_expr", "{sample}", "{rep}.bin{bin_size}"),
+    shell:
+        """
+{params.plot_multi_gene_expr} \
+    --spot {input.signal} \
+    --output {params.out_dir}
+        """
+
+rule RedeViz_build_enhance_index:
+    input:
+        index = rules.RedeViz_pretreat.output.index,
+    output:
+        index = os.path.join("analysis", "RedeViz_enhance_index", "{embedding}", "{sample}.index.pkl"),
+    threads: 28
+    shell:
+        """
+RedeViz enhance build \
+    -i {input.index} \
+    -o {output.index}
+        """
+
+rule RedeViz_enhance:
+    input:
+        index = rules.RedeViz_build_enhance_index.output.index,
+        spot = rules.point2spot.output.spot
+    output:
+        enhance = os.path.join("analysis", "RedeViz_enhance", "{embedding}", "{sample}.{rep}.enhance.tsv"),
+    threads: 28
+    shell:
+        """
+RedeViz enhance run \
+    -s {input.spot} \
+    -i {input.index} \
+    -o {output.enhance}
+        """
+
+rule stat_RedeViz_celltype:
+    input:
+        enhance = rules.RedeViz_enhance.output.enhance,
+        cell_shape = rules.ST_simulator.output.cell_shape,
+    output:
+        stat = os.path.join("analysis", "RedeViz_enhance_celltype_stat", "{embedding}", "{sample}.{rep}", "Stat.cnt.tsv"),
+    params:
+        stat_RedeViz_celltype = "python scripts/stat_RedeViz_celltype.py",
+        out_dir = os.path.join("analysis", "RedeViz_enhance_celltype_stat", "{embedding}", "{sample}.{rep}"),
+    shell:
+        """
+{params.stat_RedeViz_celltype} --pred {input.enhance} --simi {input.cell_shape} --output {params.out_dir}
+        """
+
+
+rule RedeViz_phenotype_visualization:
+    input:
+        enhance = rules.RedeViz_enhance.output.enhance,
+    output:
+        img = os.path.join("analysis", "RedeViz_enhance", "{embedding}", "{sample}.{rep}.enhance.phenotype.png"),
+    shell:
+        """
+RedeViz posttreatment plot_phenotype \
+    --input {input.enhance} \
+    --output {output.img}
+        """
+
+rule RedeViz_celltype_visualization:
+    input:
+        enhance = rules.RedeViz_enhance.output.enhance,
+        color = rules.cell_type2color.output.color
+    output:
+        img = os.path.join("analysis", "RedeViz_enhance", "{embedding}", "{sample}.{rep}.enhance.celltype.png"),
+    shell:
+        """
+RedeViz posttreatment plot_cell_type \
+    --color {input.color} \
+    --input {input.enhance} \
+    --output {output.img}
+        """
+
+rule RedeViz_segment:
+    input:
+        enhance = rules.RedeViz_enhance.output.enhance,
+    output:
+        res = os.path.join("analysis", "RedeViz_segment", "{embedding}", "{sample}.{rep}", "{domain_param}_domain", "domain.label.tsv"),
+        npy = os.path.join("analysis", "RedeViz_segment", "{embedding}", "{sample}.{rep}", "{domain_param}_domain", "domain.label.npy"),
+    params:
+        smooth_radius = lambda wildcards: domain_params[wildcards.domain_param]["smooth_radius"],
+        receptive_radius = lambda wildcards: domain_params[wildcards.domain_param]["receptive_radius"],
+        emb_radius = lambda wildcards: domain_params[wildcards.domain_param]["emb_radius"],
+        merge_emb_dist = lambda wildcards: domain_params[wildcards.domain_param]["merge_emb_dist"],
+        min_spot_num = lambda wildcards: domain_params[wildcards.domain_param]["min_spot_num"],
+        out_dir = os.path.join("analysis", "RedeViz_segment", "{embedding}", "{sample}.{rep}", "{domain_param}_domain"),
+    threads: 10
+    shell:
+        """
+RedeViz posttreatment segment \
+    --input {input.enhance} \
+    --smooth-radius {params.smooth_radius} \
+    --receptive-radius {params.receptive_radius} \
+    --embedding-radius {params.emb_radius} \
+    --merge-embedding-dist {params.merge_emb_dist} \
+    --min-spot-per-domain {params.min_spot_num} \
+    --output {params.out_dir}
+        """
+
+rule build_RedeViz_imputation_index:
+    input:
+        index = rules.RedeViz_pretreat.output.index,
+        sce = os.path.join("data", "{sample}_simple.h5ad"),
+    output:
+        index = os.path.join("analysis", "RedeViz_imputation_index", "{embedding}", "{sample}.pkl"),
+    params:
+        gene_id_label = "gene_symbol",
+    shell:
+        """
+RedeViz posttreatment impute build \
+    --index {input.index} \
+    --sce {input.sce} \
+    --gene-name-label {params.gene_id_label} \
+    --output {output.index}
+        """
+
+rule RedeViz_imputation:
+    input:
+        enhance = rules.RedeViz_enhance.output.enhance,
+        spot = rules.point2spot.output.spot,
+        index = rules.build_RedeViz_imputation_index.output,
+        gene_li = os.path.join("data", "{sample}.gene_li.txt"),
+    output:
+        touch(os.path.join("analysis", "RedeViz_imputation", "{embedding}", "{sample}", "{rep}", "done.flag")),
+    params:
+        x_label = "spot_x_index",
+        y_label = "spot_y_index",
+        UMI_label = "UMI",
+        out_dir = os.path.join("analysis", "RedeViz_imputation", "{embedding}", "{sample}", "{rep}"),
+    shell:
+        """
+RedeViz posttreatment impute run \
+    --input {input.enhance} \
+    --index {input.index} \
+    --spot {input.spot} \
+    --gene-list {input.gene_li} \
+    --spot-pos-pos-label {params.x_label} {params.y_label} \
+    --spot-UMI-label {params.UMI_label} \
+    --output {params.out_dir}
+        """
+
+rule plot_RedeViz_imputation_gene_expr:
+    input:
+        flag = rules.RedeViz_imputation.output,
+    output:
+        img = os.path.join("analysis", "RedeViz_imputation", "{embedding}", "{sample}", "{rep}", "KRT12_KRT19_CD74.png")
+    params:
+        data_dir = rules.RedeViz_imputation.params.out_dir,
+    shell:
+        """
+RedeViz posttreatment plot_gene_expr \
+    -R {params.data_dir}/KRT12.imputate.npz \
+    -G {params.data_dir}/KRT19.imputate.npz \
+    -B {params.data_dir}/CD74.imputate.npz \
+    -o {output.img}
+        """
+
+rule all:
+    input:
+        expand(rules.plot_simulated_gene_expr.output, sample=SAMPLE_LI, rep=REP_LI),
+        expand(rules.stat_RedeViz_celltype.output, embedding=embedding_dict.keys(), sample=SAMPLE_LI, rep=REP_LI),
+        expand(rules.RedeViz_phenotype_visualization.output, embedding=embedding_dict.keys(), sample=SAMPLE_LI, rep=REP_LI),
+        expand(rules.RedeViz_celltype_visualization.output, embedding=embedding_dict.keys(), sample=SAMPLE_LI, rep=REP_LI),
+        expand(rules.RedeViz_segment.output, embedding=embedding_dict.keys(), sample=SAMPLE_LI, rep=REP_LI, domain_param=domain_params.keys()),
+        expand(rules.plot_RedeViz_imputation_gene_expr.output, embedding=embedding_dict.keys(), sample=SAMPLE_LI, rep=REP_LI, domain_param=domain_params.keys()),
+        expand(rules.plot_bin_expr.output, sample=SAMPLE_LI, rep=REP_LI, bin_size=[1, 50]),
+        
