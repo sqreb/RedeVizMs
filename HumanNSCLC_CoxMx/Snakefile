@@ -1,0 +1,365 @@
+import os
+
+embedding_dict = {
+    "tSNE": {"embedding": "tSNE", "embedding_dim": 2, "embedding_resolution": 3},
+    "UMAP2": {"embedding": "UMAP", "embedding_dim": 2, "embedding_resolution": 3},
+    "UMAP3": {"embedding": "UMAP", "embedding_dim": 3, "embedding_resolution": 7.5}
+    }
+DATA_TYPE_LI = ["All", "NoMembrane"]
+RESOLUTION_LI = ["500nm", "1um"]
+SAMPLE_LI = ["Lung5_Rep1", "Lung5_Rep3", "Lung6", "Lung9_Rep1", "Lung9_Rep2", "Lung12", "Lung13"]
+RGB_GENE_DICT = {
+    "CD163_AGR2_MS4A1": {"R": "CD163", "G": "AGR2", "B": "MS4A1"},
+    "CD163_S100A6_MS4A1": {"R": "CD163", "G": "S100A6", "B": "MS4A1"},
+    "CD163_OLFM4_MS4A1": {"R": "CD163", "G": "OLFM4", "B": "MS4A1"},
+    "CD163_SPINK1_MS4A1": {"R": "CD163", "G": "SPINK1", "B": "MS4A1"}
+}
+
+rule format_ST:
+    input:
+        ST = os.path.join("data", "ST", "{sample}", "{sample}-Flat_files_and_images", "{sample}_tx_file.csv"),
+    output:
+        flag = os.path.join("analysis", "format_ST", "{sample}", "RawSignal.tsv"),
+        spot = [os.path.join("analysis", "format_ST", "{sample}", f"{data_type}.{resolution}.tsv") for data_type in DATA_TYPE_LI for resolution in RESOLUTION_LI]
+    params:
+        format_ST = "python scripts/format_ST.py",
+        out_dir = os.path.join("analysis", "format_ST", "{sample}"),
+        queue = "cpu1,cpu2,fat,amd1,hygon",
+        gpu_gres = "",
+    shell:
+        """
+{params.format_ST} --input {input.ST} --output {params.out_dir}
+        """
+
+rule format_ST_ref:
+    input:
+        expr = os.path.join("data", "ST", "{sample}", "{sample}-Flat_files_and_images", "{sample}_exprMat_file.csv"),
+        meta = os.path.join("data", "ST", "{sample}", "{sample}-Flat_files_and_images", "{sample}_metadata_file.csv"),
+    output:
+        h5ad = os.path.join("analysis", "format_ST", "{sample}", "ST.h5ad"),
+    params:
+        format_ST_ref = "python scripts/format_ST_ref.py",
+        queue = "cpu1,cpu2,fat,amd1,hygon",
+        gpu_gres = "",
+    shell:
+        """
+{params.format_ST_ref} --expr {input.expr} --meta {input.meta} --output {output.h5ad}
+        """
+
+rule run_format_ST_ref:
+    input:
+        expand(rules.format_ST_ref.output, sample=SAMPLE_LI)
+
+rule RedeViz_embedding_pretreat_ST:
+    input:
+        h5ad = rules.format_ST_ref.output.h5ad
+    output:
+        index = os.path.join("analysis", "RedeViz_ST", "embedding_info", "{embedding}", "{sample}", "pretreat.pkl"),
+        emb_info = os.path.join("analysis", "RedeViz_ST", "embedding_info", "{embedding}", "{sample}", "Embedding.bin.info.tsv"),
+        emb_cell_info = os.path.join("analysis", "RedeViz_ST", "embedding_info", "{embedding}", "{sample}", "CellInfo.tsv"),
+    params:
+        cell_type_label = "leiden",
+        embedding = lambda wildcards: embedding_dict[wildcards.embedding]["embedding"],
+        embedding_dim = lambda wildcards: embedding_dict[wildcards.embedding]["embedding_dim"],
+        embedding_resolution = lambda wildcards: embedding_dict[wildcards.embedding]["embedding_resolution"],
+        out_dir = os.path.join("analysis", "RedeViz_ST", "embedding_info", "{embedding}", "{sample}"),
+        queue = "cpu1,cpu2,amd1,fat",
+        gpu_gres = ""
+    threads: 10
+    shell:
+        """
+RedeViz enhance pretreat -i {input.h5ad} \
+    --cell-type-label {params.cell_type_label} \
+    --embedding {params.embedding} \
+    --embedding-dim {params.embedding_dim} \
+    --embedding-resolution {params.embedding_resolution} \
+    -o {params.out_dir}
+        """
+
+rule RedeViz_embedding_build_index_ST:
+    input:
+        index = rules.RedeViz_embedding_pretreat_ST.output.index,
+    output:
+        index = os.path.join("analysis", "RedeViz_ST", "RedeViz_embedding_index", "{embedding}", "{sample}.{resolution}.index.pkl"),
+    params:
+        bin_size = [9, 21],
+        cov = lambda wildcards: {"500nm": 0.5, "1um": 1.5}[wildcards.resolution],
+        queue = "gpu1,gpu2",
+        gpu_gres = "--gres=gpu:1"
+    threads: 20
+    shell:
+        """
+RedeViz enhance build -i {input.index} \
+    --bin-size {params.bin_size} \
+    --UMI-per-spot {params.cov} \
+    --norm-method None \
+    -o {output.index} --device-name cuda
+        """
+
+rule RedeViz_enhance_ST:
+    input:
+        spot = os.path.join("analysis", "format_ST", "{sample}", "{data_type}.{resolution}.tsv"),
+        index = rules.RedeViz_embedding_build_index_ST.output.index,
+    output:
+        res = protected(os.path.join("analysis", "RedeViz_ST", "RedeViz_enhance", "{embedding}", "{sample}", "{data_type}.{resolution}.predict.tsv")),
+    params:
+        cell_radius = 11,
+        x_index_label = "x",
+        y_index_label = "y",
+        gene_name_label = "Gid",
+        UMI_label = "UMI",
+        cov = lambda wildcards: {"500nm": 0.5, "1um": 1.5}[wildcards.resolution],
+        queue = "gpu1,gpu2",
+        gpu_gres = "--gres=gpu:1"
+    threads: 20
+    shell:
+        """
+RedeViz enhance run -i {input.index} -s {input.spot} -o {output.res} \
+    --x-index-label {params.x_index_label} --y-index-label {params.y_index_label} \
+    --gene-name-label {params.gene_name_label} --UMI-label {params.UMI_label} \
+    --cell-radius {params.cell_radius} \
+    --mid-signal-cutoff {params.cov} \
+    --window-size 55  --device-name cuda"""
+
+rule RedeViz_phenotype_visualization_ST:
+    input:
+        enhance = rules.RedeViz_enhance_ST.output.res,
+    output:
+        all_img = os.path.join("analysis", "RedeViz_ST", "RedeViz_enhance_pheno_plot", "{embedding}", "{sample}", "{data_type}.{resolution}.enhance.phenotype.all.png"),
+        HQ_img = os.path.join("analysis", "RedeViz_ST", "RedeViz_enhance_pheno_plot", "{embedding}", "{sample}", "{data_type}.{resolution}.enhance.phenotype.HQ.png"),
+    params:
+        queue = "cpu1,cpu2,fat,amd1,hygon",
+        gpu_gres = ""
+    shell:
+        """
+RedeViz posttreatment plot_phenotype \
+    --input {input.enhance} \
+    --output {output.all_img} \
+    --keep-other --denoise
+
+RedeViz posttreatment plot_phenotype \
+    --input {input.enhance} \
+    --output {output.HQ_img} --denoise
+        """
+
+rule get_emb_cell_type:
+    input:
+        index = rules.RedeViz_embedding_pretreat_ST.output.index,
+        celltype = os.path.join("analysis", "ref_anno", "{sample}.cellinfo.tsv"),
+    output:
+        emb_info = os.path.join("analysis", "RedeViz_ST", "embedding_info", "{embedding}", "{sample}", "EmbInfo.WithAnn.tsv"),
+        emb_cell_info = os.path.join("analysis", "RedeViz_ST", "embedding_info", "{embedding}", "{sample}", "CellInfo.WithAnn.tsv"),    
+    params:
+        get_emb_cell_type = "python scripts/get_emb_cell_type.py",
+        out_dir = os.path.join("analysis", "RedeViz_ST", "embedding_info", "{embedding}", "{sample}"),
+        queue = "cpu1,cpu2,fat,amd1,hygon",
+        gpu_gres = ""
+    shell:
+        """
+{params.get_emb_cell_type} \
+    --index {input.index} \
+    --celltype {input.celltype} \
+    --output {params.out_dir}
+        """
+
+rule plot_embedding_color:
+    input:
+        emb_info = rules.get_emb_cell_type.output.emb_info,
+    output:
+        emb_color = os.path.join("analysis", "RedeViz_ST", "embedding_info_color", "{embedding}", "{sample}", "Emb.Color.png"),
+    params:
+        plot_embedding_color = "python scripts/plot_embedding_color.py",
+        out_dir = os.path.join("analysis", "RedeViz_ST", "embedding_info_color", "{embedding}", "{sample}"),
+        embedding_dim = lambda wildcards: embedding_dict[wildcards.embedding]["embedding_dim"],
+        embedding_resolution = lambda wildcards: embedding_dict[wildcards.embedding]["embedding_resolution"],
+    shell:
+        """
+{params.plot_embedding_color} \
+    --emb-color {input.emb_info} \
+    --embedding-resolution {params.embedding_resolution} \
+    --embedding-dim {params.embedding_dim} \
+    --output {params.out_dir}
+        """
+
+rule run_plot_embedding_color:
+    input:
+        expand(rules.plot_embedding_color.output, embedding=embedding_dict.keys(), sample=SAMPLE_LI)
+
+rule RedeViz_celltype_visualization_ST:
+    input:
+        enhance = rules.RedeViz_enhance_ST.output.res,
+        emb_info = rules.get_emb_cell_type.output.emb_info,
+    output:
+        flag = touch(os.path.join("analysis", "RedeViz_ST", "RedeViz_enhance_celltype_plot", "{embedding}", "{sample}", "{data_type}.{resolution}", "plot.done")),
+    params:
+        plot_cell_type = "python scripts/plot_cell_type.py",
+        out_dir = os.path.join("analysis", "RedeViz_ST", "RedeViz_enhance_celltype_plot", "{embedding}", "{sample}", "{data_type}.{resolution}"),
+        queue = "cpu1,cpu2,fat,amd1,hygon",
+        gpu_gres = ""
+    shell:
+        """
+{params.plot_cell_type} \
+    --input {input.enhance} \
+    --emb-info {input.emb_info} \
+    --output {params.out_dir}
+        """
+
+rule build_RedeViz_imputation_index:
+    input:
+        index = rules.RedeViz_embedding_pretreat_ST.output.index,
+        sce = rules.format_ST_ref.output.h5ad,
+    output:
+        index = os.path.join("analysis", "RedeViz_ST", "RedeViz_imputation_index", "{embedding}", "impute_index_sigma_{emb_sigma}", "{sample}.pkl"),
+    params:
+        queue = "cpu1,cpu2,fat",
+        gpu_gres = ""
+    threads: 10
+    shell:
+        """
+RedeViz posttreatment impute build \
+    --index {input.index} \
+    --sce {input.sce} \
+    --embedding-smooth-sigma {wildcards.emb_sigma} \
+    --output {output.index}
+        """
+
+
+rule RedeViz_imputation:
+    input:
+        enhance = rules.RedeViz_enhance_ST.output.res,
+        spot = rules.RedeViz_enhance_ST.input.spot,
+        index = rules.build_RedeViz_imputation_index.output,
+        gene_li = os.path.join("data", "ann_gene_li.txt"),
+    output:
+        flag = touch(os.path.join("analysis", "RedeViz_ST", "RedeViz_imputation", "{embedding}", "{sample}", "impute_index_sigma_{emb_sigma}", "emb_sm_sigma_{emb_sm_sigma}", "{data_type}.{resolution}", "done.flag")),
+    params:
+        x_label = "x",
+        y_label = "y",
+        UMI_label = "UMI",
+        UMI_smooth_sigma = 10.0,
+        out_dir = os.path.join("analysis", "RedeViz_ST", "RedeViz_imputation", "{embedding}", "{sample}", "impute_index_sigma_{emb_sigma}", "emb_sm_sigma_{emb_sm_sigma}", "{data_type}.{resolution}"),
+        queue = "cpu1,cpu2,fat",
+        gpu_gres = ""
+    threads: 10
+    shell:
+        """
+RedeViz posttreatment impute run \
+    --input {input.enhance} \
+    --index {input.index} \
+    --gene-list {input.gene_li} \
+    --spot {input.spot} \
+    --spot-pos-pos-label {params.x_label} {params.y_label} \
+    --spot-UMI-label {params.UMI_label} \
+    --embedding-smooth-sigma {wildcards.emb_sm_sigma} \
+    --UMI-smooth-sigma {params.UMI_smooth_sigma} \
+    --output {params.out_dir} --denoise
+        """
+        
+rule RedeViz_plot_imputation:
+    input:
+        flag = rules.RedeViz_imputation.output,
+    output:
+        flag = touch(os.path.join("analysis", "RedeViz_ST", "RedeViz_imputation", "{embedding}", "{sample}", "impute_index_sigma_{emb_sigma}", "emb_sm_sigma_{emb_sm_sigma}", "{data_type}.{resolution}", "plot.flag")),
+    params:
+        out_dir = os.path.join("analysis", "RedeViz_ST", "RedeViz_imputation", "{embedding}", "{sample}", "impute_index_sigma_{emb_sigma}", "emb_sm_sigma_{emb_sm_sigma}", "{data_type}.{resolution}"),
+        queue = "cpu1,cpu2,fat",
+        gpu_gres = ""
+    shell:
+        """
+for f in $(ls {params.out_dir}/*.imputate.npz); do
+    RedeViz posttreatment plot_gene_expr -R ${{f}} -G ${{f}} -o $(echo ${{f}} | sed 's/npz/png/g')
+done
+        """
+
+rule RedeViz_plot_imputation_gene_li:
+    input:
+        flag = rules.RedeViz_imputation.output,
+    output:
+        plot = os.path.join("analysis", "RedeViz_ST", "RedeViz_imputation", "{embedding}", "{sample}", "impute_index_sigma_{emb_sigma}", "emb_sm_sigma_{emb_sm_sigma}", "{data_type}.{resolution}", "{gene_li}.png"),
+    params:
+        out_dir = os.path.join("analysis", "RedeViz_ST", "RedeViz_imputation", "{embedding}", "{sample}", "impute_index_sigma_{emb_sigma}", "emb_sm_sigma_{emb_sm_sigma}", "{data_type}.{resolution}"),
+        R = lambda wildcards: RGB_GENE_DICT[wildcards.gene_li]["R"],
+        G = lambda wildcards: RGB_GENE_DICT[wildcards.gene_li]["G"],
+        B = lambda wildcards: RGB_GENE_DICT[wildcards.gene_li]["B"],
+        queue = "cpu1,cpu2,fat",
+        gpu_gres = ""
+    shell:
+        """
+RedeViz posttreatment plot_gene_expr \
+    -R {params.out_dir}/{params.R}.imputate.npz \
+    -G {params.out_dir}/{params.G}.imputate.npz \
+    -B {params.out_dir}/{params.B}.imputate.npz \
+    -o {output.plot}
+        """
+
+rule spot2bin:
+    input:
+        spot = os.path.join("analysis", "format_ST", "{sample}", "{data_type}.500nm.tsv"),
+    output:
+        res = os.path.join("analysis", "spot2bin", "{sample}", "{data_type}", "bin{bin_size}.tsv"),
+    params:
+        x_index_label = "x",
+        y_index_label = "y",
+        gene_name_label = "Gid",
+        UMI_label = "UMI",
+    shell:
+        """
+RedeViz pretreatment spot2bin \
+    --spot {input.spot} \
+    --bin-size {wildcards.bin_size} \
+    --x-index-label {params.x_index_label} \
+    --y-index-label {params.y_index_label} \
+    --gene-name-label {params.gene_name_label} \
+    --UMI-label {params.UMI_label} \
+    --output {output.res}
+        """
+
+rule plot_bin_expr:
+    input:
+        signal = rules.spot2bin.output.res,
+    output:
+        img = os.path.join("analysis", "bin_expr", "{sample}", "{data_type}.bin{bin_size}", "{gene_li}.png"),
+    params:
+        R = lambda wildcards: RGB_GENE_DICT[wildcards.gene_li]["R"],
+        G = lambda wildcards: RGB_GENE_DICT[wildcards.gene_li]["G"],
+        B = lambda wildcards: RGB_GENE_DICT[wildcards.gene_li]["B"],
+        queue = "cpu1,cpu2,fat",
+        gpu_gres = ""
+    shell:
+        """
+RedeViz posttreatment plot_gene_bin_expr \
+    --input {input.signal} \
+    --x-label bin_x_index \
+    --y-label bin_y_index \
+    --gene-name-label Gid \
+    --UMI-label UMI \
+    -R {params.R} \
+    -G {params.G} \
+    -B {params.B} \
+    --output {output.img}
+        """
+
+rule all:
+    input:
+        [rules.RedeViz_phenotype_visualization_ST.output.all_img.format(
+            embedding=embedding, sample=sample, data_type=data_type, resolution=resolution
+            ) for sample in SAMPLE_LI
+            for embedding in embedding_dict.keys() for data_type in DATA_TYPE_LI for resolution in RESOLUTION_LI
+        ],[rules.RedeViz_celltype_visualization_ST.output.flag.format(
+            embedding=embedding, sample=sample, data_type=data_type, resolution=resolution
+            ) for sample in SAMPLE_LI
+            for embedding in embedding_dict.keys() for data_type in DATA_TYPE_LI for resolution in RESOLUTION_LI
+        ],[rules.plot_bin_expr.output.img.format(
+            embedding=embedding, sample=sample, data_type=data_type, bin_size=bin_size, gene_li=gene_li
+            ) for sample in ["Lung5_Rep1"]
+            for embedding in ["UMAP3"] for data_type in DATA_TYPE_LI for bin_size in ["1", "50"]
+            for gene_li in RGB_GENE_DICT.keys()
+        ],[rules.RedeViz_plot_imputation_gene_li.output.plot.format(
+            embedding=embedding, sample=sample, data_type=data_type, resolution=resolution, gene_li=gene_li, emb_sigma=emb_sigma, emb_sm_sigma=emb_sm_sigma
+            ) for sample in ["Lung5_Rep1"]
+            for embedding in ["UMAP3"] for data_type in DATA_TYPE_LI for resolution in RESOLUTION_LI
+            for gene_li in RGB_GENE_DICT.keys()
+            for emb_sigma in [3]
+            for emb_sm_sigma in [3]
+        ]
+
