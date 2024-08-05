@@ -1,0 +1,223 @@
+import os
+embedding_dict = {
+    "tSNE": {"embedding": "tSNE", "embedding_dim": 2, "embedding_resolution": 3},
+    "UMAP2": {"embedding": "UMAP", "embedding_dim": 2, "embedding_resolution": 3},
+    "UMAP3": {"embedding": "UMAP", "embedding_dim": 3, "embedding_resolution": 7.5}
+    }
+SAMPLE_LI = ["H32", "H33"]
+RGB_DICT = {
+    "CD4_CD146_CD49F": {"R": "CD4", "B": "CD146", "G": "CD49F"}
+}
+
+rule RedeViz_embedding_pretreat:
+    input:
+        h5ad = os.path.join("data", "reference", "Normal_Bone_Marrow_CODEX_Atlas.Expr.h5ad")
+    output:
+        index = os.path.join("analysis", "embedding_info", "{embedding}", "pretreat.pkl"),
+        emb_info = os.path.join("analysis", "embedding_info", "{embedding}", "Embedding.bin.info.tsv"),
+        emb_cell_info = os.path.join("analysis", "embedding_info", "{embedding}", "CellInfo.tsv"),
+    params:
+        cell_type_label = "cluster_anno_l1",
+        embedding = lambda wildcards: embedding_dict[wildcards.embedding]["embedding"],
+        embedding_dim = lambda wildcards: embedding_dict[wildcards.embedding]["embedding_dim"],
+        embedding_resolution = lambda wildcards: embedding_dict[wildcards.embedding]["embedding_resolution"],
+        out_dir = os.path.join("analysis", "embedding_info", "{embedding}"),
+        queue = "cpu1,cpu2,amd1,fat",
+        gpu_gres = ""
+    threads: 10
+    shell:
+        """
+RedeViz enhance pretreat -i {input.h5ad} \
+    --cell-type-label {params.cell_type_label} \
+    --embedding {params.embedding} \
+    --embedding-dim {params.embedding_dim} \
+    --embedding-resolution {params.embedding_resolution} \
+    -o {params.out_dir} --no-HVG --max-expr-ratio 1 --cell-state-topN-gene-max-ratio 1
+        """
+
+rule RedeViz_embedding_build_index:
+    input:
+        index = rules.RedeViz_embedding_pretreat.output.index,
+    output:
+        index = os.path.join("analysis", "RedeViz_embedding_index", "{embedding}.index.pkl"),
+    params:
+        bin_size = [3, 7],
+        queue = "gpu1",
+        gpu_gres = "--gres=gpu:1"
+    threads: 20
+    shell:
+        """
+RedeViz enhance build -i {input.index} \
+    --bin-size {params.bin_size} \
+    --UMI-per-spot 5.0 \
+    --norm-method None \
+    -o {output.index} --device-name cuda
+        """
+
+rule RedeViz_denoise:
+    input:
+        image = os.path.join("data", "CODEX", "{sample}_Scan1.qptiff"),
+    output:
+        image = os.path.join("analysis", "CODEX_denoise", "{method}", "{sample}_Scan1.qptiff"),
+    params:
+        queue = "cpu1,cpu2,fat,sugon,hygon",
+        gpu_gres = ""
+    threads: 32
+    shell:
+        """
+RedeViz pretreatment IF_denoise --image {input.image} --output {output.image} --method {wildcards.method}
+        """
+
+
+rule plot_raw_gene_expr:
+    input:
+        image = os.path.join("data", "CODEX", "{sample}_Scan1.qptiff"),
+    output:
+        flag = touch(os.path.join("analysis", "raw_signal", "{sample}", "plot.flag")),
+    params:
+        plot_gene_expr = "python scripts/plot_gene_expr.py",
+        out_dir = os.path.join("analysis", "raw_signal", "{sample}"),
+        queue = "cpu1,cpu2,fat,sugon,hygon",
+        gpu_gres = ""
+    threads: 1
+    shell:
+        """
+{params.plot_gene_expr} --input {input.image} --output {params.out_dir}
+        """
+
+rule plot_denoise_gene_expr:
+    input:
+        image = os.path.join("analysis", "CODEX_denoise", "rescale", "{sample}_Scan1.qptiff"),
+    output:
+        flag = touch(os.path.join("analysis", "denoise_signal", "{sample}", "plot.flag")),
+    params:
+        plot_gene_expr = "python scripts/plot_gene_expr.py",
+        out_dir = os.path.join("analysis", "denoise_signal", "{sample}"),
+        queue = "cpu1,cpu2,fat,sugon,hygon",
+        gpu_gres = ""
+    threads: 1
+    shell:
+        """
+{params.plot_gene_expr} --input {input.image} --output {params.out_dir}
+        """
+
+def get_gene_RGB_params(gene_li):
+    tmp_dict = RGB_DICT[gene_li]
+    R = tmp_dict["R"]
+    G = tmp_dict["G"]
+    B = tmp_dict["B"]
+    params = ""
+    if R:
+        params += f" -R {R}"
+    if G:
+        params += f" -G {G}"
+    if B:
+        params += f" -B {B}"
+    return params
+
+rule plot_denoise_gene_expr_RGB:
+    input:
+        image = os.path.join("analysis", "CODEX_denoise", "rescale", "{sample}_Scan1.qptiff"),
+    output:
+        plot = os.path.join("analysis", "denoise_signal_RGB", "{sample}", "{gene_li}.png"),
+    params:
+        plot_gene_expr_RGB = "python scripts/plot_gene_expr_RGB.py",
+        queue = "cpu1,cpu2,fat,sugon,hygon",
+        gpu_gres = "",
+        RGB_params = lambda wildcards: get_gene_RGB_params(wildcards.gene_li),
+    threads: 1
+    shell:
+        """
+{params.plot_gene_expr_RGB} --input {input.image} --output {output.plot} {params.RGB_params}
+        """
+
+
+rule RedeViz_enhance_CODEX_denoise:
+    input:
+        index = rules.RedeViz_embedding_build_index.output.index,
+        image = rules.RedeViz_denoise.output.image
+    output:
+        res = os.path.join("analysis", "RedeViz_enhance_CODEX_denoise", "{embedding}", "{method}", "{sample}.predict.tsv"),
+    params:
+        queue = "gpu1",
+        gpu_gres = "--gres=gpu:1"
+    threads: 20
+    shell:
+        """
+RedeViz enhance run_CODEX -i {input.index} --image {input.image} -o {output.res} \
+    --window-size 50 --mid-signal-cutoff 12.0 --device-name cuda"""
+
+
+rule RedeViz_phenotype_visualization_denoise:
+    input:
+        enhance = rules.RedeViz_enhance_CODEX_denoise.output.res,
+    output:
+        all_img = os.path.join("analysis", "RedeViz_enhance_pheno_plot_denoise", "{embedding}", "{method}", "{sample}.enhance.phenotype.all.png"),
+        HQ_img = os.path.join("analysis", "RedeViz_enhance_pheno_plot_denoise", "{embedding}", "{method}", "{sample}.enhance.phenotype.HQ.png"),
+    params:
+        queue = "cpu1,cpu2,fat,sugon,hygon",
+        gpu_gres = ""
+    shell:
+        """
+RedeViz posttreatment plot_phenotype \
+    --input {input.enhance} \
+    --output {output.all_img} \
+    --keep-other --denoise
+
+RedeViz posttreatment plot_phenotype \
+    --input {input.enhance} \
+    --output {output.HQ_img} --denoise
+        """
+
+
+rule RedeViz_celltype_visualization_denoise:
+    input:
+        enhance = rules.RedeViz_enhance_CODEX_denoise.output.res,
+        color = os.path.join("data", "color.tsv"),
+    output:
+        all_img = os.path.join("analysis", "RedeViz_enhance_celltype_plot_denoise", "{embedding}", "{method}", "{sample}.enhance.celltype.all.png"),
+        HQ_img = os.path.join("analysis", "RedeViz_enhance_celltype_plot_denoise", "{embedding}", "{method}", "{sample}.enhance.celltype.HQ.png"),
+    params:
+        queue = "cpu1,cpu2,fat,sugon,hygon",
+        gpu_gres = ""
+    shell:
+        """
+RedeViz posttreatment plot_cell_type \
+    --color {input.color} \
+    --input {input.enhance} \
+    --output {output.all_img} \
+    --keep-other --denoise
+
+RedeViz posttreatment plot_cell_type \
+    --color {input.color} \
+    --input {input.enhance} \
+    --output {output.HQ_img} --denoise
+        """
+
+rule run_RedeViz_denoise:
+    input:
+        expand(rules.RedeViz_phenotype_visualization_denoise.output, embedding=["UMAP3"], method=["rescale"], sample=SAMPLE_LI),
+        expand(rules.RedeViz_celltype_visualization_denoise.output, embedding=["UMAP3"], method=["rescale"], sample=SAMPLE_LI)
+
+
+rule plot_embedding_color:
+    input:
+        emb_info = rules.RedeViz_embedding_pretreat.output.emb_info,
+        color = os.path.join("data", "color.tsv"),
+    output:
+        emb_color = os.path.join("analysis", "embedding_info_color", "{embedding}", "Emb.Color.png"),
+    params:
+        plot_embedding_color = "python scripts/plot_embedding_color.py",
+        out_dir = os.path.join("analysis", "embedding_info_color", "{embedding}"),
+        embedding_dim = lambda wildcards: embedding_dict[wildcards.embedding]["embedding_dim"],
+        embedding_resolution = lambda wildcards: embedding_dict[wildcards.embedding]["embedding_resolution"],
+    shell:
+        """
+{params.plot_embedding_color} \
+    --emb-info {input.emb_info} \
+    --color {input.color} \
+    --embedding-resolution {params.embedding_resolution} \
+    --embedding-dim {params.embedding_dim} \
+    --output {params.out_dir}
+        """
+
